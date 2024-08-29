@@ -1,0 +1,209 @@
+cat > cluster.yaml <<EOF
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: test
+  region: ap-northeast-2
+
+nodeGroups:
+  - name: node-group-1
+    instanceType: t2.small
+    desiredCapacity: 2
+    iam:
+      withAddonPolicies:
+        autoScaler: true
+        ebs: true
+       
+fargateProfiles:
+  - name: fp-default
+    selectors:
+      - namespace: default
+EOF
+      
+eksctl create cluster -f cluster.yaml
+
+# EBS-CSI-Driver 설치
+helm repo add aws-ebs-csi-driver https://kubernetes-sigs.github.io/aws-ebs-csi-driver
+helm repo add kube-state-metrics https://kubernetes.github.io/kube-state-metrics
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo add grafana https://grafana.github.io/helm-charts
+helm repo update
+
+helm upgrade --install aws-ebs-csi-driver \
+    --namespace kube-system \
+    --set enableVolumeScheduling=true \
+    --set enableVolumeResizing=true \
+    --set enableVolumeSnapshot=true \
+    aws-ebs-csi-driver/aws-ebs-csi-driver
+
+# Fargate 로드밸런서 설치 - ALB 설정할때 필요함, NLB, CLB는 없어도 됨
+eksctl utils associate-iam-oidc-provider \
+    --region ap-northeast-2 \
+    --cluster Sellcar-dev-01 \
+    --approve
+
+curl -O https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.4.7/docs/install/iam_policy.json
+
+aws iam create-policy \
+    --policy-name AWSLoadBalancerControllerIAMPolicy \
+    --policy-document file://iam_policy.json
+
+eksctl create iamserviceaccount \
+    --cluster Sellcar-dev-01 \
+    --namespace kube-system \
+    --name aws-load-balancer-controller \
+    --attach-policy-arn arn:aws:iam::000000000000:policy/AWSLoadBalancerControllerIAMPolicy \
+    --override-existing-serviceaccounts \
+    --approve
+
+# OIDC를 발급 받았으면 콘솔 인증 메뉴에서 OIDC 연결을 해준다.
+
+helm delete aws-alb-ingress-controller -n kube-system
+helm delete aws-load-balancer-controller -n kube-system
+
+helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  -n kube-system \
+  --set clusterName=test \
+  --set serviceAccount.create=false \
+  --set serviceAccount.name=aws-load-balancer-controller \
+  --set region=ap-northeast-2 \
+  --set vpcId=vpc-05152cc9783c12ab1
+helm upgrade aws-load-balancer-controller eks/aws-load-balancer-controller \
+  -n kube-system \
+  --set clusterName=test \
+  --set serviceAccount.create=false \
+  --set serviceAccount.name=aws-load-balancer-controller \
+  --set region=ap-northeast-2 \
+  --set vpcId=vpc-05152cc9783c12ab1
+
+kubectl apply -k "github.com/aws/eks-charts/stable/aws-load-balancer-controller/crds?ref=master"
+
+# 확인
+kubectl get deployment -n kube-system aws-load-balancer-controller
+
+# EFS CSI 드라이버 배포 - https://waspro.tistory.com/778
+curl -o iam-policy-example.json https://raw.githubusercontent.com/kubernetes-sigs/aws-efs-csi-driver/v1.2.0/docs/iam-policy-example.json
+
+aws iam create-policy \
+    --policy-name AmazonEKS_EFS_CSI_Driver_Policy \
+    --policy-document file://iam-policy-example.json
+
+aws eks describe-cluster --name test --query "cluster.identity.oidc.issuer" --output text
+
+cat <<EOF > trust-policy.json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::000000000000:oidc-provider/oidc.eks.ap-northeast-2.amazonaws.com/id/A40F2096E424DCC66F985D50CA32BFF4"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "oidc.eks.ap-northeast-2.amazonaws.com/id/55CCBB98B3C854FABF9D29002EA2A00C:sub": "system:serviceaccount:kube-system:efs-csi-controller-sa"
+        }
+      }
+    }
+  ]
+}
+EOF
+aws iam create-role \
+  --role-name AmazonEKS_EFS_CSI_DriverRole \
+  --assume-role-policy-document file://"trust-policy.json"
+
+aws iam attach-role-policy \
+  --policy-arn arn:aws:iam::000000000000:policy/AmazonEKS_EFS_CSI_Driver_Policy \
+  --role-name AmazonEKS_EFS_CSI_DriverRole
+
+kubectl kustomize "github.com/kubernetes-sigs/aws-efs-csi-driver/deploy/kubernetes/overlays/stable/?ref=release-1.3" > public-ecr-driver.yaml
+
+vi public-ecr-driver.yaml
+name: efs-csi-controller-sa 윗줄에 아래 내용 수정해서 추가
+annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/AmazonEKS_EFS_CSI_DriverRole
+
+kubectl apply -f public-ecr-driver.yaml
+
+aws ec2 create-security-group --description efs-test-sg --group-name efs-sg --vpc-id vpc-02aa5b14a94d667c7
+
+aws ec2 authorize-security-group-ingress --group-id sg-082df88ff4a72015b --protocol tcp --port 2049 --cidr 192.168.0.0/16
+
+aws efs create-file-system --creation-token eks-efs # filesystemid = fs-00963b6548fd8f687
+
+aws efs create-mount-target --file-system-id fs-00963b6548fd8f687 --subnet-id subnet-058374175e0066c61 --security-group sg-082df88ff4a72015b
+aws efs create-mount-target --file-system-id fs-00963b6548fd8f687 --subnet-id subnet-07f858d1143d7ae78 --security-group sg-082df88ff4a72015b
+aws efs create-mount-target --file-system-id fs-00963b6548fd8f687 --subnet-id subnet-097d728cbbe48e66b --security-group sg-082df88ff4a72015b
+aws efs create-mount-target --file-system-id fs-00963b6548fd8f687 --subnet-id subnet-024cb90afb77814b7 --security-group sg-082df88ff4a72015b
+aws efs create-mount-target --file-system-id fs-00963b6548fd8f687 --subnet-id subnet-073446914057955b0 --security-group sg-082df88ff4a72015b
+aws efs create-mount-target --file-system-id fs-00963b6548fd8f687 --subnet-id subnet-0bc7b91456548796e --security-group sg-082df88ff4a72015b
+
+# 쿠버네티스 대시보드 UI 배포
+#kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v2.6.1/aio/deploy/recommended.yaml
+kubectl apply -f recommended.yaml
+
+cat > dashboard-adminuser.yaml <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: admin-user
+  namespace: kubernetes-dashboard
+EOF
+kubectl apply -f dashboard-adminuser.yaml
+
+cat > dashboard-adminuser.yaml <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: admin-user
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: admin-user
+  namespace: kubernetes-dashboard
+EOF
+
+kubectl apply -f dashboard-adminuser.yaml
+kubectl -n kubernetes-dashboard create token admin-user
+
+# Kubernetes-dashboard 외부 접속 연결
+cat > dashboard-loadbalance.yaml <<EOF
+kind: Service
+apiVersion: v1
+metadata:
+  labels:
+    k8s-app: kubernetes-dashboard
+  name: kubernetes-dashboard
+  namespace: kubernetes-dashboard
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: external
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+spec:
+  ports:
+    - port: 443
+      targetPort: 8443
+      protocol: TCP
+  type: LoadBalancer
+  selector:
+    k8s-app: kubernetes-dashboard
+
+EOF
+kubectl apply -f dashboard-loadbalance.yaml
+
+# 지표 서버 설치
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+kubectl get deployment metrics-server -n kube-system
+
+
+
+
+
+
+
+
