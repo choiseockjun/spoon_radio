@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: dev
+  name: nginx-service
+  labels:
+    app: nginx-service
+spec:
+  minReadySeconds: 40
+  selector:
+    matchLabels:
+      app: nginx-service
+  template:
+    metadata:
+      labels:
+        app: nginx-service
+    spec:
+      #nodeName: ip-10-30-161-236.ap-northeast-2.compute.internal
+      volumes:
+        #- name: elastic-apm-config
+        #  configMap:
+        #    name: nginx-service-config
+        #- name: nas-persistent-storage
+        #  persistentVolumeClaim:
+        #    claimName: dev-nas-pvc
+        #- name: aws-efs-elf
+        #  persistentVolumeClaim:
+        #    claimName: efs-claim
+      containers:
+        - name: nginx-service
+          image: docker.io/nginx:1.23.1
+          #envFrom:
+          #  - configMapRef:
+          #      name: nginx-service-config
+          #  - secretRef:
+          #      name: nginx-service-secret
+          #resources:
+          #  limits:
+          #    cpu: "1"
+          #    memory: 1500Mi
+          #  requests:
+          #    cpu: "0.5"
+          #    memory: 50Mi
+          volumeMounts:
+            #- name: nas-persistent-storage
+            #  mountPath: /mnt/sc
+            #- name: elastic-apm-config
+            #  mountPath: /elasticapm.properties
+            #  subPath: elasticapm.properties
+            #- name: aws-efs-elf
+            #  mountPath: /data
+      #imagePullSecrets:
+      #  - name: dockerconfig

@@ -1,0 +1,11 @@
+---
+replicas:
+  - name: nginx-service
+    count: 1
+images:
+  - name: docker.io/nginx:1.23.1
+resources:
+  - configMap.yaml
+  - deployment.yaml
+  - service.yaml
+  - secret.yaml
